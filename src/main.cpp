@@ -8,6 +8,33 @@
 const uint16_t samples = 4096; // MAKE SURE that this is a power of 2 (very important)
 const double samplingFrequency = 38000; // fine tuned no touchy pls
 
+boolean clipping = 0;
+
+//data storage variables
+uint16_t newData = 0;
+uint16_t prevData = 0;
+unsigned int elapsedTime = 0;//keeps elapsedTime and sends vales to store in elapsedTimer[] occasionally
+int elapsedTimer[10];//sstorage for timing of events
+int slope[10];//storage for slope of events
+unsigned int totalelapsedTimer;//used to calculate period
+unsigned int period;//storage for period of wave
+uint16_t currentIndex = 0;//current storage currentIndex
+float frequency;//storage for frequency calculations
+int maxSlope = 0;//used to calculate max slope as trigger point
+int newSlope;//storage for incoming slope data
+
+//variables for decided whether you have a match
+uint16_t noMatch = 0;//counts how many non-matches you've received to reset variables if it's been too long
+uint slopeTol = 3;//slope tolerance- adjust this if you need
+int elapsedTimerTol = 10;//elapsedTimer tolerance- adjust this if you need
+
+//variables for amp detection
+unsigned int ampelapsedTimer = 0;
+uint maxAmp = 0;
+uint checkMaxAmp;
+uint ampThreshold = 30;//raise if you have a very noisy signal
+
+
 // ESP32 pin
 #define ADC_PIN 34 
 #define STRING_SELECTOR_PIN 27  
@@ -16,7 +43,6 @@ const double samplingFrequency = 38000; // fine tuned no touchy pls
 #define TUNER_SERVO_PIN 14  
 
 // signal parameters
-#define SIGNAL_THRESHOLD 200
 #define TOLERANCE 2  
 #define REFERENCE_SPEED 343.2 
 
@@ -25,11 +51,7 @@ bool isDisplayingTuningMode = false;
 int currentConfig = 0;
 int selectedString = 0;
 
-// real and imag samples for FFT
-float vReal[samples];
-float vImag[samples];
-
-// BMP280, Servo, FFT, Kalman Filter, and LCD objects
+// BMP280, Servo, Kalman Filter, and LCD objects
 Adafruit_BMP280 bmp;
 Servo tuningServo;
 SimpleKalmanFilter kalmanFilter(1, 1, 0.01);
@@ -54,10 +76,12 @@ unsigned long lastButtonPress = 0;
 const unsigned long debounceDelay = 100;
 
 void handleButtons();
-double getFrequency();
+void getFrequency();
+double getPeriod();
 double getSpeedOfSound();
 double compensateFrequency(double measuredFreq);
 void lcdDisplay(double frequency, double targetFreq);
+void reset();
 // void adjustServo(double frequency, double targetFreq);
 
 void setup() {
@@ -80,26 +104,23 @@ void setup() {
                   Adafruit_BMP280::SAMPLING_X2,     /* Temp. oversampling */
                   Adafruit_BMP280::SAMPLING_X16,    /* Pressure oversampling */
                   Adafruit_BMP280::FILTER_X16,      /* Filtering. */
-                  Adafruit_BMP280::STANDBY_MS_500); /* Standby time. */
+                  Adafruit_BMP280::STANDBY_MS_500); /* Standby elapsedTime. */
 }
 
 void loop() {
   handleButtons();
   
   if (!isDisplayingTuningMode && isTuningEnabled) { 
-    double frequency = getFrequency();
+    getFrequency();
     double compensatedFreq = compensateFrequency(frequency);
     float temp = bmp.readTemperature();
     double targetFreq = tuningConfigs[currentConfig].frequencies[selectedString];
     lcdDisplay(frequency, targetFreq);
     // adjustServo(frequency, targetFreq);
   }
-  double f = getFrequency();
-  double t = bmp.readTemperature();
   Serial.print("Detected Frequency: ");
-  Serial.println(f, 2);
-  Serial.print("Temp: ");
-  Serial.println(t);
+  Serial.println(frequency, 2);
+
 }
 
 void handleButtons() {
@@ -136,31 +157,8 @@ void handleButtons() {
   }
 }
 
-double getFrequency() {
-  for (uint16_t i = 0; i < samples; i++) {
-    int rawSensorValue = analogRead(ADC_PIN);
-    vReal[i] = kalmanFilter.updateEstimate(rawSensorValue);
-    vImag[i] = 0.0;
-  }
-  // Perform FFT
-  float twiddle_factors[samples];
-  fft_config_t* fft_config = fft_init(samples, FFT_REAL, FFT_FORWARD, vReal, vImag);
-  fft_execute(fft_config);
-
-  // Calculate magnitudes and find the major peak
-  double maxMag = 0;
-  int peakIndex = 0;
-  for (int i = 1; i < samples / 2; i++) {
-    float magnitude = sqrt(vReal[i] * vReal[i] + vImag[i] * vImag[i]);
-    if (magnitude > maxMag) {
-      maxMag = magnitude;
-      peakIndex = i;
-    }
-  }
-
-  double peakFrequency = peakIndex * samplingFrequency / samples;
-  fft_destroy(fft_config); // Clean up
-  return peakFrequency;
+void getFrequency() {
+  frequency = 38462/float(frequency);
 }
 
 double getSpeedOfSound() {
@@ -211,3 +209,80 @@ void lcdDisplay(double frequency, double targetFreq) {
 //   }
 //   Serial.println("string in tune yayyy");
 // }
+
+double getPeriod() {
+  
+  prevData = newData; //store previous value
+  newData = analogRead(34); // data from PZ sensor
+
+  if (prevData < 2047 && newData >= 2047) { // if increasing and crossing midpoint
+    newSlope = newData - prevData; // calculate slope
+    if (abs(newSlope - maxSlope) < slopeTol) { // if slopes are equal:
+
+      //record new data and reset elapsedTime
+      slope[currentIndex] = newSlope;
+      elapsedTimer[currentIndex] = elapsedTime;
+      elapsedTime = 0;
+      if (currentIndex == 0){//new max slope just reset
+        noMatch = 0;
+        currentIndex++;//increment currentIndex
+      }
+      else if (abs(elapsedTimer[0] - elapsedTimer[currentIndex]) < elapsedTimerTol && abs(slope[0] - newSlope) < slopeTol) { // if elapsedTimer duration and slopes match
+        //sum elapsedTimer values
+        totalelapsedTimer = 0;
+        for (byte i=0; i < currentIndex; i++){
+          totalelapsedTimer += elapsedTimer[i];
+        }
+        period = totalelapsedTimer;//set period
+
+        //reset new zero currentIndex values to compare with
+        elapsedTimer[0] = elapsedTimer[currentIndex];
+        slope[0] = slope[currentIndex];
+        currentIndex = 1; //set currentIndex to 1
+        noMatch = 0;
+      }
+      else { // crossing midpoint but not match
+        currentIndex++; // increment currentIndex
+        if (currentIndex > 9){
+          reset();
+        }
+      }
+    }
+    else if (newSlope>maxSlope) { // if new slope is much larger than max slope
+      maxSlope = newSlope;
+      elapsedTime = 0;//reset clock
+      noMatch = 0;
+      currentIndex = 0;//reset currentIndex
+    }
+    else{ // slope not steep enough
+      noMatch++; // increment no match counter
+      if (noMatch > 9) {
+        reset();
+      }
+    }
+  }
+    
+  if (newData == 0 || newData == 4095) { //if clipping
+    clipping = 1; // currently clipping
+  }
+  
+  elapsedTime++; // increment elapsedTimer at rate of 38.5kHz
+  
+  ampelapsedTimer++; // increment amplitude elapsedTimer
+  if (abs(2045 - analogRead(34)) > maxAmp) {
+    maxAmp = abs(2045 - analogRead(34));
+  }
+  if (ampelapsedTimer == 1000) {
+    ampelapsedTimer = 0;
+    checkMaxAmp = maxAmp;
+    maxAmp = 0;
+  }
+
+  return period;
+}
+
+void reset(){ // clean  out some variables
+  currentIndex = 0; // reset currentIndex
+  noMatch = 0; // reset match couner
+  maxSlope = 0; // reset slope
+}
