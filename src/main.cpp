@@ -9,7 +9,7 @@
 
 // wifi connection
 const char* ssid = "PAWS-Secure";
-const char* password = "Chipper2016!";
+const char* password = "";
 
 // ESP32 pins
 #define ADC_PIN 34 
