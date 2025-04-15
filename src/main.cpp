@@ -1,41 +1,17 @@
 #include <Arduino.h>
-#include <fft.h>
+#include <arduinoFFT.h>
 #include <ESP32Servo.h>
 #include <SimpleKalmanFilter.h>
 #include <LiquidCrystal.h>
 #include <Adafruit_BMP280.h>
+#include <WiFi.h>
+// #include <ThingSpeak.h>
 
-const uint16_t samples = 4096; // MAKE SURE that this is a power of 2 (very important)
-const double samplingFrequency = 38000; // fine tuned no touchy pls
+// wifi connection
+const char* ssid = "PAWS-Secure";
+const char* password = "Chipper2016!";
 
-boolean clipping = 0;
-
-//data storage variables
-uint16_t newData = 0;
-uint16_t prevData = 0;
-unsigned int elapsedTime = 0;//keeps elapsedTime and sends vales to store in elapsedTimer[] occasionally
-int elapsedTimer[10];//sstorage for timing of events
-int slope[10];//storage for slope of events
-unsigned int totalelapsedTimer;//used to calculate period
-unsigned int period;//storage for period of wave
-uint16_t currentIndex = 0;//current storage currentIndex
-float frequency;//storage for frequency calculations
-int maxSlope = 0;//used to calculate max slope as trigger point
-int newSlope;//storage for incoming slope data
-
-//variables for decided whether you have a match
-uint16_t noMatch = 0;//counts how many non-matches you've received to reset variables if it's been too long
-uint slopeTol = 3;//slope tolerance- adjust this if you need
-int elapsedTimerTol = 10;//elapsedTimer tolerance- adjust this if you need
-
-//variables for amp detection
-unsigned int ampelapsedTimer = 0;
-uint maxAmp = 0;
-uint checkMaxAmp;
-uint ampThreshold = 30;//raise if you have a very noisy signal
-
-
-// ESP32 pin
+// ESP32 pins
 #define ADC_PIN 34 
 #define STRING_SELECTOR_PIN 27  
 #define BUTTON_CONFIG_PIN 12    
@@ -45,11 +21,21 @@ uint ampThreshold = 30;//raise if you have a very noisy signal
 // signal parameters
 #define TOLERANCE 2  
 #define REFERENCE_SPEED 343.2 
+float frequency = 0;
+
 
 bool isTuningEnabled = false;
 bool isDisplayingTuningMode = false;
 int currentConfig = 0;
 int selectedString = 0;
+
+const uint16_t SAMPLES = 2048;   // Number of FFT samples (power of 2)
+const double SAMPLING_FREQUENCY = 6000; // Sampling frequency in Hz 
+
+float vReal[SAMPLES];  // Real part of FFT input
+float vImag[SAMPLES];  // Imaginary part of FFT input
+
+ArduinoFFT<float> FFT = ArduinoFFT<float>(vReal, vImag, SAMPLES, SAMPLING_FREQUENCY);
 
 // BMP280, Servo, Kalman Filter, and LCD objects
 Adafruit_BMP280 bmp;
@@ -76,17 +62,30 @@ unsigned long lastButtonPress = 0;
 const unsigned long debounceDelay = 100;
 
 void handleButtons();
-void getFrequency();
-double getPeriod();
+void waitForStableSignal();
+double getFrequencyFFT();
 double getSpeedOfSound();
 double compensateFrequency(double measuredFreq);
 void lcdDisplay(double frequency, double targetFreq);
 void reset();
-// void adjustServo(double frequency, double targetFreq);
+void adjustServo(double frequency, double targetFreq);
 
 void setup() {
   Serial.begin(115200);
   analogReadResolution(12);
+
+  // WiFi.begin(ssid, password);
+  // while (WiFi.status() != WL_CONNECTED) {
+  //   delay(1000);
+  //   Serial.println("Connecting to WiFi...");
+  //   }
+  // Serial.println("Connected to WiFi");
+  // WiFiClient client;
+  // unsigned long myChannelNumber = 2824966;
+  // const char * myWriteAPIKey = "FPEIQA6RV3WTZD12";
+
+  // ThingSpeak.begin(client);
+
   lcd.begin(16, 2);
   lcd.print("Tuner Ready!");
   tuningServo.attach(TUNER_SERVO_PIN);
@@ -96,9 +95,12 @@ void setup() {
   pinMode(BUTTON_TUNE_PIN, INPUT_PULLDOWN);
   pinMode(STRING_SELECTOR_PIN, INPUT_PULLDOWN);
 
-  if (!bmp.begin(0x76)) {
+  tuningServo.write(90);
+
+  if (!bmp.begin(0x77)) {
     Serial.println("BMP280 sensor not found!");
   }
+
     /* Default settings from datasheet. */
   bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     /* Operating Mode. */
                   Adafruit_BMP280::SAMPLING_X2,     /* Temp. oversampling */
@@ -111,15 +113,16 @@ void loop() {
   handleButtons();
   
   if (!isDisplayingTuningMode && isTuningEnabled) { 
-    getFrequency();
     double compensatedFreq = compensateFrequency(frequency);
     float temp = bmp.readTemperature();
     double targetFreq = tuningConfigs[currentConfig].frequencies[selectedString];
-    lcdDisplay(frequency, targetFreq);
+    frequency = getFrequencyFFT();
+    Serial.print("Frequency: ");
+    Serial.println(frequency);
+    lcdDisplay(compensatedFreq + 3, targetFreq);
     // adjustServo(frequency, targetFreq);
+
   }
-  Serial.print("Detected Frequency: ");
-  Serial.println(frequency, 2);
 
 }
 
@@ -156,10 +159,62 @@ void handleButtons() {
     lastButtonPress = currentMillis;
   }
 }
+double getFrequencyFFT() {
+  // 1) Sample
+  unsigned long microsBetween = 1000000UL / SAMPLING_FREQUENCY;
+  unsigned long lastMicros = micros();
+  for (int i = 0; i < SAMPLES; i++) {
+    while (micros() - lastMicros < microsBetween);
+    lastMicros += microsBetween;
+    int a = analogRead(ADC_PIN);
+    vReal[i] = a;
+    vImag[i] = 0.0;
+  }
 
-void getFrequency() {
-  frequency = 38462/float(frequency);
+  // 2) FFT
+  FFT.windowing(vReal, SAMPLES, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+  FFT.compute(vReal, vImag, SAMPLES, FFT_FORWARD);
+  FFT.complexToMagnitude(vReal, vImag, SAMPLES);
+
+  // 3) Find top-3 peaks
+  double peakMag[3]  = {0, 0, 0};
+  double peakFreq[3] = {0, 0, 0};
+  double binWidth   = SAMPLING_FREQUENCY / double(SAMPLES);
+  int half = SAMPLES/2;
+
+  for (int i = 1; i < half; i++) {
+    double mag = vReal[i];
+    double f   = i * binWidth;
+
+    if (f < 70.0 || f > 370.0) continue;
+
+    if (mag > peakMag[0]) {
+      // shift down
+      peakMag[2]  = peakMag[1];  peakFreq[2]  = peakFreq[1];
+      peakMag[1]  = peakMag[0];  peakFreq[1]  = peakFreq[0];
+      peakMag[0]  = mag;         peakFreq[0]  = f;
+    }
+    else if (mag > peakMag[1]) {
+      peakMag[2]  = peakMag[1];  peakFreq[2]  = peakFreq[1];
+      peakMag[1]  = mag;         peakFreq[1]  = f;
+    }
+    else if (mag > peakMag[2]) {
+      peakMag[2]  = mag;
+      peakFreq[2]  = f;
+    }
+  }
+
+  // 4) Fundamental = smallest of the three peaks
+  double fundamental = peakFreq[0];
+  for (int k = 1; k < 3; k++) {
+    if (peakFreq[k] > 0 && peakFreq[k] < fundamental) {
+      fundamental = peakFreq[k];
+    }
+  }
+
+  return fundamental;
 }
+
 
 double getSpeedOfSound() {
   double temperature = bmp.readTemperature();
@@ -185,104 +240,67 @@ void lcdDisplay(double frequency, double targetFreq) {
   lcd.print(" Hz");
 }
 
-// void adjustServo(double frequency, double targetFreq) {
-//   int servo_angle = tuningServo.read();
-//   int step = 2;
+void adjustServo(double currentFreq, double targetFreq) {
+    static int servo_angle = tuningServo.read();
 
-//   while (abs(frequency - targetFreq) > TOLERANCE) {
-//     if (frequency < targetFreq - TOLERANCE) {
-//       servo_angle += step; // tighten peg
-//     } else if (frequency > targetFreq - TOLERANCE) {
-//       servo_angle -= step; // loosen peg
-//     }
-
-//     servo_angle = constrain(servo_angle, 0, 180); // keep within 0 - 180
-//     tuningServo.write(servo_angle);
-//     delay(50); // wait a bit
-
-//     // recheck
-//     frequency = getFrequency();
-
-//     if (abs(frequency - targetFreq) > 5) {
-//       step = 1;
-//     }
-//   }
-//   Serial.println("string in tune yayyy");
-// }
-
-double getPeriod() {
-  
-  prevData = newData; //store previous value
-  newData = analogRead(34); // data from PZ sensor
-
-  if (prevData < 2047 && newData >= 2047) { // if increasing and crossing midpoint
-    newSlope = newData - prevData; // calculate slope
-    if (abs(newSlope - maxSlope) < slopeTol) { // if slopes are equal:
-
-      //record new data and reset elapsedTime
-      slope[currentIndex] = newSlope;
-      elapsedTimer[currentIndex] = elapsedTime;
-      elapsedTime = 0;
-      if (currentIndex == 0){//new max slope just reset
-        noMatch = 0;
-        currentIndex++;//increment currentIndex
-      }
-      else if (abs(elapsedTimer[0] - elapsedTimer[currentIndex]) < elapsedTimerTol && abs(slope[0] - newSlope) < slopeTol) { // if elapsedTimer duration and slopes match
-        //sum elapsedTimer values
-        totalelapsedTimer = 0;
-        for (byte i=0; i < currentIndex; i++){
-          totalelapsedTimer += elapsedTimer[i];
-        }
-        period = totalelapsedTimer;//set period
-
-        //reset new zero currentIndex values to compare with
-        elapsedTimer[0] = elapsedTimer[currentIndex];
-        slope[0] = slope[currentIndex];
-        currentIndex = 1; //set currentIndex to 1
-        noMatch = 0;
-      }
-      else { // crossing midpoint but not match
-        currentIndex++; // increment currentIndex
-        if (currentIndex > 9){
-          reset();
-        }
-      }
-    }
-    else if (newSlope>maxSlope) { // if new slope is much larger than max slope
-      maxSlope = newSlope;
-      elapsedTime = 0;//reset clock
-      noMatch = 0;
-      currentIndex = 0;//reset currentIndex
-    }
-    else{ // slope not steep enough
-      noMatch++; // increment no match counter
-      if (noMatch > 9) {
-        reset();
-      }
-    }
-  }
+    double error = targetFreq - currentFreq;  // Frequency error
+    double K = 25.0;  // Experimentally determined gain (adjust this value)
     
-  if (newData == 0 || newData == 4095) { //if clipping
-    clipping = 1; // currently clipping
-  }
-  
-  elapsedTime++; // increment elapsedTimer at rate of 38.5kHz
-  
-  ampelapsedTimer++; // increment amplitude elapsedTimer
-  if (abs(2045 - analogRead(34)) > maxAmp) {
-    maxAmp = abs(2045 - analogRead(34));
-  }
-  if (ampelapsedTimer == 1000) {
-    ampelapsedTimer = 0;
-    checkMaxAmp = maxAmp;
-    maxAmp = 0;
-  }
+    // Use logarithmic function to determine peg rotation needed
+    double deltaTheta = K * log(1 + abs(error) / targetFreq);
 
-  return period;
+    if (abs(error) <= TOLERANCE) {
+        Serial.println("Frequency matched! Stopping tuning...");
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("In tune!");
+        return;  // Exit the function early to stop adjusting the servo
+    }
+    
+    // Adjust tuning peg direction based on frequency error
+    if (error > 0) {
+        servo_angle += deltaTheta; // Increase tension (tighten)
+    } else if (error < 0) {
+        servo_angle -= deltaTheta; // Decrease tension (loosen)
+    }
+
+    // Constrain the servo range
+    servo_angle = constrain(servo_angle, 0, 180);
+    tuningServo.write(servo_angle);
+    delay(10);
+
+    Serial.print("Servo Angle: ");
+    Serial.println(servo_angle);
+
+    if (servo_angle == 180 || servo_angle == 0) {
+        Serial.println("Servo at limit! Resetting...");
+
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Servo Resetting...");
+        delay(3000);  // Wait for 3 seconds
+
+        tuningServo.write(90);  // Reset servo to middle position
+        servo_angle = 90;       // Update stored angle
+        
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Reseting");
+        lcd.setCursor(0, 1);
+        lcd.print("Tuning...");
+        delay(2000);  // Wait for 2 seconds
+      } else {
+      Serial.println("String in tune yayyy!");
+    }
 }
 
-void reset(){ // clean  out some variables
-  currentIndex = 0; // reset currentIndex
-  noMatch = 0; // reset match couner
-  maxSlope = 0; // reset slope
-}
+// void uploadThingSpeak() {
+//   ThingSpeak.setField(1, analogRead(34));
+//   int x = ThingSpeak.writeFields(2824966, "FPEIQA6RV3WTZD12");
+//   if (x == 200){
+//     Serial.println("Channel update successful.");
+//   }
+//   else {
+//     Serial.println("Problem updating channel. HTTP error code " + String(x));
+//   }
+// }
