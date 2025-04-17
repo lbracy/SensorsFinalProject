@@ -29,9 +29,8 @@ bool isDisplayingTuningMode = false;
 int currentConfig = 0;
 int selectedString = 0;
 
-const uint16_t SAMPLES = 2048;   // Number of FFT samples (power of 2)
-const double SAMPLING_FREQUENCY = 6000; // Sampling frequency in Hz 
-
+const uint16_t SAMPLES = 4096;   // Number of FFT samples (power of 2)
+const double SAMPLING_FREQUENCY = 8000; // Sampling frequency in Hz 
 float vReal[SAMPLES];  // Real part of FFT input
 float vImag[SAMPLES];  // Imaginary part of FFT input
 
@@ -117,8 +116,6 @@ void loop() {
     float temp = bmp.readTemperature();
     double targetFreq = tuningConfigs[currentConfig].frequencies[selectedString];
     frequency = getFrequencyFFT();
-    Serial.print("Frequency: ");
-    Serial.println(frequency);
     lcdDisplay(compensatedFreq + 3, targetFreq);
     // adjustServo(frequency, targetFreq);
 
@@ -159,60 +156,92 @@ void handleButtons() {
     lastButtonPress = currentMillis;
   }
 }
+
 double getFrequencyFFT() {
+  double fundamental = 0;
+  double prev_freq = 0;
+
   // 1) Sample
   unsigned long microsBetween = 1000000UL / SAMPLING_FREQUENCY;
   unsigned long lastMicros = micros();
-  for (int i = 0; i < SAMPLES; i++) {
-    while (micros() - lastMicros < microsBetween);
-    lastMicros += microsBetween;
-    int a = analogRead(ADC_PIN);
-    vReal[i] = a;
-    vImag[i] = 0.0;
+
+  if (analogRead(ADC_PIN) >= 200) {
+
+    Serial.println("ADC Value:");
+    Serial.println(analogRead(34));
+    Serial.println("Starting sample");
+
+    for (int i = 0; i < SAMPLES; i++) {
+      while (micros() - lastMicros < microsBetween);
+      lastMicros += microsBetween;
+      int a = analogRead(ADC_PIN);
+      vReal[i] = a;
+      vImag[i] = 0.0;
+    }
+
+    Serial.println("Finished sampling");
+
+    // 2) FFT
+    FFT.windowing(vReal, SAMPLES, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+    FFT.compute(vReal, vImag, SAMPLES, FFT_FORWARD);
+    FFT.complexToMagnitude(vReal, vImag, SAMPLES);
+
+    // 3) Find top-3 peaks
+    double peakMag[3]  = {0, 0, 0};
+    double peakFreq[3] = {0, 0, 0};
+    double binWidth = SAMPLING_FREQUENCY / double(SAMPLES);
+    int half = SAMPLES / 2;
+
+    for (int i = 1; i < half; i++) {
+      double mag = vReal[i];
+      double f = i * binWidth;
+
+      if (f < 70.0 || f > 370.0) continue;
+
+      if (mag > peakMag[0]) {
+        peakMag[2] = peakMag[1]; peakFreq[2] = peakFreq[1];
+        peakMag[1] = peakMag[0]; peakFreq[1] = peakFreq[0];
+        peakMag[0] = mag;        peakFreq[0] = f;
+      }
+      else if (mag > peakMag[1]) {
+        peakMag[2] = peakMag[1]; peakFreq[2] = peakFreq[1];
+        peakMag[1] = mag;        peakFreq[1] = f;
+      }
+      else if (mag > peakMag[2]) {
+        peakMag[2] = mag;
+        peakFreq[2] = f;
+      }
+    }
+
+    // 4) Choose fundamental (lowest of top 3)
+    fundamental = peakFreq[0];
+    for (int k = 1; k < 3; k++) {
+      if (peakFreq[k] > 0 && peakFreq[k] < fundamental) {
+        fundamental = peakFreq[k];
+      }
+    }
+
+    // 5) Harmonic check (div by 2 or 3)
+    double adjustedFreq = fundamental;
+    int binFund = round(fundamental / binWidth);
+    int binDiv2 = round((fundamental / 2.0) / binWidth);
+    int binDiv3 = round((fundamental / 3.0) / binWidth);
+
+    if (binDiv2 > 1 && vReal[binDiv2] > (0.5 * vReal[binFund])) {
+      adjustedFreq = fundamental / 2.0;
+    } else if (binDiv3 > 1 && vReal[binDiv3] > (0.5 * vReal[binFund])) {
+      adjustedFreq = fundamental / 3.0;
+    }
+
+    prev_freq = adjustedFreq;
+    Serial.print("Corrected Frequency: ");
+    Serial.println(adjustedFreq);
+
+  } else {
+    lcdDisplay(prev_freq, tuningConfigs[currentConfig].frequencies[selectedString]);
   }
 
-  // 2) FFT
-  FFT.windowing(vReal, SAMPLES, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
-  FFT.compute(vReal, vImag, SAMPLES, FFT_FORWARD);
-  FFT.complexToMagnitude(vReal, vImag, SAMPLES);
-
-  // 3) Find top-3 peaks
-  double peakMag[3]  = {0, 0, 0};
-  double peakFreq[3] = {0, 0, 0};
-  double binWidth   = SAMPLING_FREQUENCY / double(SAMPLES);
-  int half = SAMPLES/2;
-
-  for (int i = 1; i < half; i++) {
-    double mag = vReal[i];
-    double f   = i * binWidth;
-
-    if (f < 70.0 || f > 370.0) continue;
-
-    if (mag > peakMag[0]) {
-      // shift down
-      peakMag[2]  = peakMag[1];  peakFreq[2]  = peakFreq[1];
-      peakMag[1]  = peakMag[0];  peakFreq[1]  = peakFreq[0];
-      peakMag[0]  = mag;         peakFreq[0]  = f;
-    }
-    else if (mag > peakMag[1]) {
-      peakMag[2]  = peakMag[1];  peakFreq[2]  = peakFreq[1];
-      peakMag[1]  = mag;         peakFreq[1]  = f;
-    }
-    else if (mag > peakMag[2]) {
-      peakMag[2]  = mag;
-      peakFreq[2]  = f;
-    }
-  }
-
-  // 4) Fundamental = smallest of the three peaks
-  double fundamental = peakFreq[0];
-  for (int k = 1; k < 3; k++) {
-    if (peakFreq[k] > 0 && peakFreq[k] < fundamental) {
-      fundamental = peakFreq[k];
-    }
-  }
-
-  return fundamental;
+  return prev_freq;
 }
 
 
