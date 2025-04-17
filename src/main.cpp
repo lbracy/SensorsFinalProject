@@ -18,6 +18,10 @@ const char* password = "";
 #define BUTTON_TUNE_PIN 13      
 #define TUNER_SERVO_PIN 14  
 
+#define HISTORY_SIZE 5
+double freqHistory[HISTORY_SIZE] = {0};
+int historyIndex = 0;
+
 // signal parameters
 #define TOLERANCE 2  
 #define REFERENCE_SPEED 343.2 
@@ -65,6 +69,7 @@ void handleButtons();
 void waitForStableSignal();
 double getFrequencyFFT();
 double getSpeedOfSound();
+double smoothFrequency(double newFreq);
 double compensateFrequency(double measuredFreq);
 double autocorrectLowFreq(double lastValidFrequency, int stringIndex);
 void lcdDisplay(double frequency, double targetFreq);
@@ -116,16 +121,21 @@ void loop() {
   if (!isDisplayingTuningMode && isTuningEnabled) {
     double rawFreq = getFrequencyFFT();
     if (rawFreq > 0) {
-      frequency = rawFreq;
-      lastValidFrequency = rawFreq;  // Store it
+      frequency = smoothFrequency(rawFreq);
+      lastValidFrequency = frequency;  // Store it
     }
 
     double correctedFreq = autocorrectLowFreq(lastValidFrequency, selectedString);
     double compensatedFreq = compensateFrequency(correctedFreq);
     double targetFreq = tuningConfigs[currentConfig].frequencies[selectedString];
 
+    Serial.print("Raw Freq: ");
+    Serial.print(rawFreq);
+    Serial.print(" Hz -> Smoothed: ");
+    Serial.println(frequency);
+
     lcdDisplay(compensatedFreq, targetFreq);  // +3 if you're compensating extra for hardware quirks
-    // adjustServo(compensatedFreq, targetFreq);
+    adjustServo(compensatedFreq, targetFreq);
   }
 }
 
@@ -171,7 +181,7 @@ double getFrequencyFFT() {
   unsigned long microsBetween = 1000000UL / SAMPLING_FREQUENCY;
   unsigned long lastMicros = micros();
 
-  if (analogRead(ADC_PIN) >= 200) {
+  if (analogRead(ADC_PIN) >= 400) {
 
     Serial.println("ADC Value:");
     Serial.println(analogRead(34));
@@ -244,8 +254,8 @@ double getFrequencyFFT() {
     }
 
     prev_freq = adjustedFreq;
-    Serial.print("Corrected Frequency: ");
-    Serial.println(adjustedFreq);
+
+    Serial.print(prev_freq);
 
   } else {
     lcdDisplay(prev_freq, tuningConfigs[currentConfig].frequencies[selectedString]);
@@ -291,6 +301,30 @@ double compensateFrequency(double measuredFreq) {
   return measuredFreq * (actualSpeed / REFERENCE_SPEED);
 }
 
+double smoothFrequency(double newFreq) {
+  // Sanity check: discard clearly bad values
+  if (newFreq < 40 || newFreq > 1000) return freqHistory[(historyIndex - 1 + HISTORY_SIZE) % HISTORY_SIZE];
+
+  // Save new value into circular buffer
+  freqHistory[historyIndex] = newFreq;
+  historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+
+  // Copy and sort for median
+  double sorted[HISTORY_SIZE];
+  memcpy(sorted, freqHistory, sizeof(freqHistory));
+  for (int i = 0; i < HISTORY_SIZE - 1; i++) {
+    for (int j = i + 1; j < HISTORY_SIZE; j++) {
+      if (sorted[i] > sorted[j]) {
+        double temp = sorted[i];
+        sorted[i] = sorted[j];
+        sorted[j] = temp;
+      }
+    }
+  }
+
+  return sorted[HISTORY_SIZE / 2]; // return median
+}
+
 void lcdDisplay(double frequency, double targetFreq) {
   lcd.clear();
   lcd.setCursor(0, 0);
@@ -304,58 +338,65 @@ void lcdDisplay(double frequency, double targetFreq) {
 }
 
 void adjustServo(double currentFreq, double targetFreq) {
-    static int servo_angle = tuningServo.read();
+    static int servo_angle = tuningServo.read();  // Keep track of current servo position
 
-    double error = targetFreq - currentFreq;  // Frequency error
-    double K = 25.0;  // Experimentally determined gain (adjust this value)
-    
-    // Use logarithmic function to determine peg rotation needed
-    double deltaTheta = K * log(1 + abs(error) / targetFreq);
+    // Calculate the frequency error
+    double error = targetFreq - currentFreq;
+    double tolerance = 2.0;  // Frequency tolerance (Hz)
 
-    if (abs(error) <= TOLERANCE) {
+    // If the frequency is within tolerance, stop tuning
+    if (abs(error) <= tolerance) {
         Serial.println("Frequency matched! Stopping tuning...");
         lcd.clear();
         lcd.setCursor(0, 0);
         lcd.print("In tune!");
         return;  // Exit the function early to stop adjusting the servo
     }
-    
-    // Adjust tuning peg direction based on frequency error
-    if (error > 0) {
-        servo_angle += deltaTheta; // Increase tension (tighten)
-    } else if (error < 0) {
-        servo_angle -= deltaTheta; // Decrease tension (loosen)
+
+    // Calculate the tuning period based on the frequency error
+    double tunePeriod = abs(error) * 3.0;  // Lower factor for smoother adjustment
+    int direction = ((error > 0) ? 1 : -1) * -1;
+
+    // Calculate change in angle
+    int servoDelta = direction * (int)(tunePeriod);
+
+    // Limit max movement
+    if (servoDelta > 5) servoDelta = 5;
+    if (servoDelta < -5) servoDelta = -5;
+
+    // Adjust angle
+    servo_angle += servoDelta;
+    servo_angle = constrain(servo_angle, 0, 180);  // Stay within bounds
+
+    // Check for limit reached
+    if (servo_angle == 0 || servo_angle == 180) {
+        Serial.println("Servo reached limit! Resetting...");
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Servo limit!");
+        lcd.setCursor(0, 1);
+        lcd.print("Resetting...");
+
+        delay(1000);  // Pause for user to see message
+
+        // Reset to neutral position (optional)
+        servo_angle = 90;
+        tuningServo.write(servo_angle);
+        delay(500);  // Give it time to move
+
+        // Return to stop adjusting after hitting limit
+        return;
     }
 
-    // Constrain the servo range
-    servo_angle = constrain(servo_angle, 0, 180);
+    // Move the servo
     tuningServo.write(servo_angle);
-    delay(10);
+    delay(100);
 
     Serial.print("Servo Angle: ");
     Serial.println(servo_angle);
-
-    if (servo_angle == 180 || servo_angle == 0) {
-        Serial.println("Servo at limit! Resetting...");
-
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("Servo Resetting...");
-        delay(3000);  // Wait for 3 seconds
-
-        tuningServo.write(90);  // Reset servo to middle position
-        servo_angle = 90;       // Update stored angle
-        
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("Reseting");
-        lcd.setCursor(0, 1);
-        lcd.print("Tuning...");
-        delay(2000);  // Wait for 2 seconds
-      } else {
-      Serial.println("String in tune yayyy!");
-    }
 }
+
+
 
 // void uploadThingSpeak() {
 //   ThingSpeak.setField(1, analogRead(34));
