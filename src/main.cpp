@@ -28,9 +28,10 @@ bool isTuningEnabled = false;
 bool isDisplayingTuningMode = false;
 int currentConfig = 0;
 int selectedString = 0;
+double lastValidFrequency = -1.0;
 
 const uint16_t SAMPLES = 4096;   // Number of FFT samples (power of 2)
-const double SAMPLING_FREQUENCY = 8000; // Sampling frequency in Hz 
+const double SAMPLING_FREQUENCY = 4096; // Sampling frequency in Hz 
 float vReal[SAMPLES];  // Real part of FFT input
 float vImag[SAMPLES];  // Imaginary part of FFT input
 
@@ -65,6 +66,7 @@ void waitForStableSignal();
 double getFrequencyFFT();
 double getSpeedOfSound();
 double compensateFrequency(double measuredFreq);
+double autocorrectLowFreq(double lastValidFrequency, int stringIndex);
 void lcdDisplay(double frequency, double targetFreq);
 void reset();
 void adjustServo(double frequency, double targetFreq);
@@ -110,17 +112,21 @@ void setup() {
 
 void loop() {
   handleButtons();
-  
-  if (!isDisplayingTuningMode && isTuningEnabled) { 
-    double compensatedFreq = compensateFrequency(frequency);
-    float temp = bmp.readTemperature();
+
+  if (!isDisplayingTuningMode && isTuningEnabled) {
+    double rawFreq = getFrequencyFFT();
+    if (rawFreq > 0) {
+      frequency = rawFreq;
+      lastValidFrequency = rawFreq;  // Store it
+    }
+
+    double correctedFreq = autocorrectLowFreq(lastValidFrequency, selectedString);
+    double compensatedFreq = compensateFrequency(correctedFreq);
     double targetFreq = tuningConfigs[currentConfig].frequencies[selectedString];
-    frequency = getFrequencyFFT();
-    lcdDisplay(compensatedFreq + 3, targetFreq);
-    // adjustServo(frequency, targetFreq);
 
+    lcdDisplay(compensatedFreq, targetFreq);  // +3 if you're compensating extra for hardware quirks
+    // adjustServo(compensatedFreq, targetFreq);
   }
-
 }
 
 void handleButtons() {
@@ -221,15 +227,19 @@ double getFrequencyFFT() {
       }
     }
 
+    if (peakFreq[0] < 100.0 || fundamental < 70.0 || fundamental > 370.0) {
+      return -1.0;
+    }
+
     // 5) Harmonic check (div by 2 or 3)
     double adjustedFreq = fundamental;
     int binFund = round(fundamental / binWidth);
     int binDiv2 = round((fundamental / 2.0) / binWidth);
     int binDiv3 = round((fundamental / 3.0) / binWidth);
 
-    if (binDiv2 > 1 && vReal[binDiv2] > (0.5 * vReal[binFund])) {
+    if (binDiv2 > 1 && vReal[binDiv2] > (0.25 * vReal[binFund])) {
       adjustedFreq = fundamental / 2.0;
-    } else if (binDiv3 > 1 && vReal[binDiv3] > (0.5 * vReal[binFund])) {
+    } else if (binDiv3 > 1 && vReal[binDiv3] > (0.25 * vReal[binFund])) {
       adjustedFreq = fundamental / 3.0;
     }
 
@@ -242,6 +252,30 @@ double getFrequencyFFT() {
   }
 
   return prev_freq;
+}
+
+double autocorrectLowFreq(double detectedFreq, int stringIndex) {
+  // Only apply for low E (index 0) and A (index 1)
+  if (stringIndex > 1 || detectedFreq < 70.0 || detectedFreq > 370.0) return detectedFreq;
+
+  // Check for possible octave harmonics
+  if (detectedFreq > 140.0 && detectedFreq < 180.0) {
+    double half = detectedFreq / 2.0;
+    if (half > 70.0 && half < 100.0) {
+      Serial.println("Autocorrected by /2");
+      return half;
+    }
+  }
+
+  if (detectedFreq > 240.0 && detectedFreq < 270.0) {
+    double third = detectedFreq / 3.0;
+    if (third > 70.0 && third < 100.0) {
+      Serial.println("Autocorrected by /3");
+      return third;
+    }
+  }
+
+  return detectedFreq;
 }
 
 
