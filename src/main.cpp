@@ -33,6 +33,7 @@ bool isDisplayingTuningMode = false;
 int currentConfig = 0;
 int selectedString = 0;
 double lastValidFrequency = -1.0;
+double compensatedFreq = 0;
 
 const uint16_t SAMPLES = 4096;   // Number of FFT samples (power of 2)
 const double SAMPLING_FREQUENCY = 4096; // Sampling frequency in Hz 
@@ -62,7 +63,9 @@ Tuning tuningConfigs[] = {
 };
 
 // debouncing things
-unsigned long lastButtonPress = 0;
+unsigned long lastConfigPress = 0;
+unsigned long lastTunePress = 0;
+unsigned long lastStringPress = 0;
 const unsigned long debounceDelay = 100;
 
 void handleButtons();
@@ -118,60 +121,65 @@ void setup() {
 void loop() {
   handleButtons();
 
+  double targetFreq = tuningConfigs[currentConfig].frequencies[selectedString];
+
   if (!isDisplayingTuningMode && isTuningEnabled) {
     double rawFreq = getFrequencyFFT();
     if (rawFreq > 0) {
-      frequency = smoothFrequency(rawFreq);
       lastValidFrequency = frequency;  // Store it
+      double correctedFreq = autocorrectLowFreq(lastValidFrequency, selectedString);
+      compensatedFreq = compensateFrequency(correctedFreq);
+
+      Serial.print("Freq: ");
+      Serial.print(rawFreq);
+      Serial.print(" Hz");
+      Serial.println();
+
+      lcdDisplay(rawFreq, targetFreq); 
+      adjustServo(rawFreq + 3, targetFreq);
     }
-
-    double correctedFreq = autocorrectLowFreq(lastValidFrequency, selectedString);
-    double compensatedFreq = compensateFrequency(correctedFreq);
-    double targetFreq = tuningConfigs[currentConfig].frequencies[selectedString];
-
-    Serial.print("Raw Freq: ");
-    Serial.print(rawFreq);
-    Serial.print(" Hz -> Smoothed: ");
-    Serial.println(frequency);
-
-    lcdDisplay(compensatedFreq, targetFreq);  // +3 if you're compensating extra for hardware quirks
-    adjustServo(compensatedFreq, targetFreq);
   }
 }
 
 void handleButtons() {
   unsigned long currentMillis = millis();
 
-  if (digitalRead(BUTTON_CONFIG_PIN) == HIGH && currentMillis - lastButtonPress > debounceDelay) {
+  // Config button logic
+  if (digitalRead(BUTTON_CONFIG_PIN) == HIGH && currentMillis - lastConfigPress > debounceDelay) {
     currentConfig = (currentConfig + 1) % (sizeof(tuningConfigs) / sizeof(tuningConfigs[0]));
     isDisplayingTuningMode = true;
     Serial.print("Selected Tuning: ");
     Serial.println(tuningConfigs[currentConfig].name);
-    
+
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("Tuning Mode:");
     lcd.setCursor(0, 1);
     lcd.print(tuningConfigs[currentConfig].name);
-    
-    lastButtonPress = currentMillis;
+
+    lastConfigPress = currentMillis;
   }
 
-  if (digitalRead(BUTTON_TUNE_PIN) == HIGH && currentMillis - lastButtonPress > debounceDelay) {
+  // Tune toggle button logic
+  if (digitalRead(BUTTON_TUNE_PIN) == HIGH && currentMillis - lastTunePress > debounceDelay) {
     isTuningEnabled = !isTuningEnabled;
     isDisplayingTuningMode = false;
     Serial.print("Tuning: ");
     Serial.println(isTuningEnabled ? "ON" : "OFF");
-    lastButtonPress = currentMillis;
+
+    lastTunePress = currentMillis;
   }
 
-  if (digitalRead(STRING_SELECTOR_PIN) == HIGH && currentMillis - lastButtonPress > debounceDelay) {
+  // String selector button logic
+  if (digitalRead(STRING_SELECTOR_PIN) == HIGH && currentMillis - lastStringPress > debounceDelay) {
     selectedString = (selectedString + 1) % 6;
     Serial.print("Selected String: ");
     Serial.println(selectedString + 1);
-    lastButtonPress = currentMillis;
+
+    lastStringPress = currentMillis;
   }
 }
+
 
 double getFrequencyFFT() {
   double fundamental = 0;
@@ -181,11 +189,7 @@ double getFrequencyFFT() {
   unsigned long microsBetween = 1000000UL / SAMPLING_FREQUENCY;
   unsigned long lastMicros = micros();
 
-  if (analogRead(ADC_PIN) >= 400) {
-
-    Serial.println("ADC Value:");
-    Serial.println(analogRead(34));
-    Serial.println("Starting sample");
+  if (analogRead(ADC_PIN) >= 993) {
 
     for (int i = 0; i < SAMPLES; i++) {
       while (micros() - lastMicros < microsBetween);
@@ -354,15 +358,15 @@ void adjustServo(double currentFreq, double targetFreq) {
     }
 
     // Calculate the tuning period based on the frequency error
-    double tunePeriod = abs(error) * 3.0;  // Lower factor for smoother adjustment
+    double tunePeriod = abs(error) * 5.0;  // Lower factor for smoother adjustment
     int direction = ((error > 0) ? 1 : -1) * -1;
 
     // Calculate change in angle
     int servoDelta = direction * (int)(tunePeriod);
 
     // Limit max movement
-    if (servoDelta > 5) servoDelta = 5;
-    if (servoDelta < -5) servoDelta = -5;
+    if (servoDelta > 30) servoDelta = 30;
+    if (servoDelta < -30) servoDelta = -30;
 
     // Adjust angle
     servo_angle += servoDelta;
