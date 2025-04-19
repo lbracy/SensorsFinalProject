@@ -8,8 +8,8 @@
 // #include <ThingSpeak.h>
 
 // wifi connection
-const char* ssid = "PAWS-Secure";
-const char* password = "";
+const char* ssid = "Lucian's iPhone";
+const char* password = "dont join";
 
 // ESP32 pins
 #define ADC_PIN 34 
@@ -27,13 +27,11 @@ int historyIndex = 0;
 #define REFERENCE_SPEED 343.2 
 float frequency = 0;
 
-
 bool isTuningEnabled = false;
 bool isDisplayingTuningMode = false;
 int currentConfig = 0;
 int selectedString = 0;
 double lastValidFrequency = -1.0;
-double compensatedFreq = 0;
 
 const uint16_t SAMPLES = 4096;   // Number of FFT samples (power of 2)
 const double SAMPLING_FREQUENCY = 4096; // Sampling frequency in Hz 
@@ -62,22 +60,80 @@ Tuning tuningConfigs[] = {
   {"Open D", {73.42, 98.00, 146.83, 185.00, 246.94, 329.63}}
 };
 
-// debouncing things
-unsigned long lastConfigPress = 0;
-unsigned long lastTunePress = 0;
-unsigned long lastStringPress = 0;
-const unsigned long debounceDelay = 100;
+// debouncing and interrupts
+unsigned long lastButtonPress = 0;
+const unsigned long debounceDelay = 300;
+volatile bool tuneButtonPressed = false;
+volatile bool stringSelectorPressed = false;
+volatile bool configButtonPressed = false;
+
+void IRAM_ATTR onConfigButtonPress() {
+  configButtonPressed = true;
+}
+
+void IRAM_ATTR onTuneButtonPress() {
+  tuneButtonPressed = true;
+}
+
+void IRAM_ATTR onStringSelectorPress() {
+  stringSelectorPressed = true;
+}
+
+
 
 void handleButtons();
-void waitForStableSignal();
 double getFrequencyFFT();
 double getSpeedOfSound();
 double smoothFrequency(double newFreq);
 double compensateFrequency(double measuredFreq);
 double autocorrectLowFreq(double lastValidFrequency, int stringIndex);
 void lcdDisplay(double frequency, double targetFreq);
-void reset();
 void adjustServo(double frequency, double targetFreq);
+
+void handleButtons() {
+  unsigned long currentMillis = millis();
+
+  if (configButtonPressed && currentMillis - lastButtonPress > debounceDelay) {
+    configButtonPressed = false;
+
+    currentConfig = (currentConfig + 1) % (sizeof(tuningConfigs) / sizeof(tuningConfigs[0]));
+    isDisplayingTuningMode = true;
+
+    Serial.print("Selected Tuning: ");
+    Serial.println(tuningConfigs[currentConfig].name);
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Tuning Mode:");
+    lcd.setCursor(0, 1);
+    lcd.print(tuningConfigs[currentConfig].name);
+
+    lastButtonPress = currentMillis;
+  }
+
+  if (tuneButtonPressed && currentMillis - lastButtonPress > debounceDelay) {
+    tuneButtonPressed = false;
+
+    isTuningEnabled = !isTuningEnabled;
+    isDisplayingTuningMode = false;
+
+    Serial.print("Tuning: ");
+    Serial.println(isTuningEnabled ? "ON" : "OFF");
+
+    lastButtonPress = currentMillis;
+  }
+
+  if (stringSelectorPressed && currentMillis - lastButtonPress > debounceDelay) {
+    stringSelectorPressed = false;
+
+    selectedString = (selectedString + 1) % 6;
+
+    Serial.print("Selected String: ");
+    Serial.println(selectedString + 1);
+
+    lastButtonPress = currentMillis;
+  }
+}
 
 void setup() {
   Serial.begin(115200);
@@ -99,10 +155,13 @@ void setup() {
   lcd.print("Tuner Ready!");
   tuningServo.attach(TUNER_SERVO_PIN);
 
-  // pulldowns
+  // pulldowns and interrupts
   pinMode(BUTTON_CONFIG_PIN, INPUT_PULLDOWN);
   pinMode(BUTTON_TUNE_PIN, INPUT_PULLDOWN);
   pinMode(STRING_SELECTOR_PIN, INPUT_PULLDOWN);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_CONFIG_PIN), onConfigButtonPress, RISING);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_TUNE_PIN), onTuneButtonPress, RISING);
+  attachInterrupt(digitalPinToInterrupt(STRING_SELECTOR_PIN), onStringSelectorPress, RISING);
 
   tuningServo.write(90);
 
@@ -121,65 +180,26 @@ void setup() {
 void loop() {
   handleButtons();
 
-  double targetFreq = tuningConfigs[currentConfig].frequencies[selectedString];
-
   if (!isDisplayingTuningMode && isTuningEnabled) {
     double rawFreq = getFrequencyFFT();
     if (rawFreq > 0) {
+      frequency = smoothFrequency(rawFreq);
       lastValidFrequency = frequency;  // Store it
-      double correctedFreq = autocorrectLowFreq(lastValidFrequency, selectedString);
-      compensatedFreq = compensateFrequency(correctedFreq);
-
-      Serial.print("Freq: ");
-      Serial.print(rawFreq);
-      Serial.print(" Hz");
-      Serial.println();
-
-      lcdDisplay(rawFreq, targetFreq); 
-      adjustServo(rawFreq + 3, targetFreq);
     }
+
+    double correctedFreq = autocorrectLowFreq(lastValidFrequency, selectedString);
+    double compensatedFreq = compensateFrequency(correctedFreq);
+    double targetFreq = tuningConfigs[currentConfig].frequencies[selectedString];
+
+    Serial.print("Raw Freq: ");
+    Serial.print(rawFreq);
+    Serial.print(" Hz -> Smoothed: ");
+    Serial.println(frequency);
+
+    lcdDisplay(compensatedFreq, targetFreq);
+    adjustServo(compensatedFreq, targetFreq);
   }
 }
-
-void handleButtons() {
-  unsigned long currentMillis = millis();
-
-  // Config button logic
-  if (digitalRead(BUTTON_CONFIG_PIN) == HIGH && currentMillis - lastConfigPress > debounceDelay) {
-    currentConfig = (currentConfig + 1) % (sizeof(tuningConfigs) / sizeof(tuningConfigs[0]));
-    isDisplayingTuningMode = true;
-    Serial.print("Selected Tuning: ");
-    Serial.println(tuningConfigs[currentConfig].name);
-
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Tuning Mode:");
-    lcd.setCursor(0, 1);
-    lcd.print(tuningConfigs[currentConfig].name);
-
-    lastConfigPress = currentMillis;
-  }
-
-  // Tune toggle button logic
-  if (digitalRead(BUTTON_TUNE_PIN) == HIGH && currentMillis - lastTunePress > debounceDelay) {
-    isTuningEnabled = !isTuningEnabled;
-    isDisplayingTuningMode = false;
-    Serial.print("Tuning: ");
-    Serial.println(isTuningEnabled ? "ON" : "OFF");
-
-    lastTunePress = currentMillis;
-  }
-
-  // String selector button logic
-  if (digitalRead(STRING_SELECTOR_PIN) == HIGH && currentMillis - lastStringPress > debounceDelay) {
-    selectedString = (selectedString + 1) % 6;
-    Serial.print("Selected String: ");
-    Serial.println(selectedString + 1);
-
-    lastStringPress = currentMillis;
-  }
-}
-
 
 double getFrequencyFFT() {
   double fundamental = 0;
@@ -189,7 +209,7 @@ double getFrequencyFFT() {
   unsigned long microsBetween = 1000000UL / SAMPLING_FREQUENCY;
   unsigned long lastMicros = micros();
 
-  if (analogRead(ADC_PIN) >= 993) {
+  if (analogRead(ADC_PIN) >= 400) {
 
     for (int i = 0; i < SAMPLES; i++) {
       while (micros() - lastMicros < microsBetween);
@@ -358,15 +378,15 @@ void adjustServo(double currentFreq, double targetFreq) {
     }
 
     // Calculate the tuning period based on the frequency error
-    double tunePeriod = abs(error) * 5.0;  // Lower factor for smoother adjustment
+    double tunePeriod = abs(error) * 3.0;  // Lower factor for smoother adjustment
     int direction = ((error > 0) ? 1 : -1) * -1;
 
     // Calculate change in angle
     int servoDelta = direction * (int)(tunePeriod);
 
     // Limit max movement
-    if (servoDelta > 30) servoDelta = 30;
-    if (servoDelta < -30) servoDelta = -30;
+    if (servoDelta > 5) servoDelta = 5;
+    if (servoDelta < -5) servoDelta = -5;
 
     // Adjust angle
     servo_angle += servoDelta;
